@@ -1,0 +1,471 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>SSE Voice Chat Internals</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: single reading column (~720px) with wide breakouts for the diagram and tables.
+   Transport colors are information: orange = upload POST, teal = SSE down, violet = WebSocket, green = provider HTTP stream. */
+:root {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --fg: #171a20;
+  --muted: #586070;
+  --line: #dadee5;
+  --code-bg: #eceff3;
+  --up: #c2410c;
+  --down: #0e7490;
+  --ws: #7c3aed;
+  --http: #4d7c0f;
+  --warn: #b45309;
+  --font-display: "Bricolage Grotesque", "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1216; --surface: #161a20; --fg: #e6e9ee; --muted: #9aa3b1; --line: #2a303a;
+    --code-bg: #1c2129; --up: #fb923c; --down: #22d3ee; --ws: #a78bfa; --http: #a3e635; --warn: #fbbf24;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1216; --surface: #161a20; --fg: #e6e9ee; --muted: #9aa3b1; --line: #2a303a;
+  --code-bg: #1c2129; --up: #fb923c; --down: #22d3ee; --ws: #a78bfa; --http: #a3e635; --warn: #fbbf24;
+  color-scheme: dark;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 48px 72px;
+}
+.page { max-width: 960px; margin: 0 auto; display: flex; flex-direction: column; gap: 56px; }
+.prose { max-width: 720px; }
+
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; line-height: 1.15; margin: 0; }
+h1 { font-size: clamp(2.2rem, 5vw, 3.2rem); font-weight: 700; letter-spacing: -0.02em; }
+h2 { font-size: 1.7rem; font-weight: 700; letter-spacing: -0.01em; }
+h3 { font-size: 1.15rem; font-weight: 600; }
+p { margin: 0; }
+section { display: flex; flex-direction: column; gap: 18px; }
+.eyebrow { font-family: var(--font-mono); font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.lead { font-size: 1.15rem; color: var(--muted); max-width: 680px; }
+a { color: var(--down); }
+code { font-family: var(--font-mono); font-size: 0.86em; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; }
+pre { margin: 0; background: var(--code-bg); border-radius: 8px; padding: 14px 16px; overflow-x: auto; font-family: var(--font-mono); font-size: 0.84rem; line-height: 1.55; }
+pre code { background: none; padding: 0; font-size: inherit; }
+ul, ol { margin: 0; padding-left: 1.3em; display: flex; flex-direction: column; gap: 6px; }
+
+.hero { display: flex; flex-direction: column; gap: 16px; }
+.callout {
+  border: 1px solid var(--line); border-left: 4px solid var(--ws);
+  background: var(--surface); border-radius: 8px; padding: 14px 18px; max-width: 720px;
+}
+.callout strong { color: var(--ws); }
+
+/* Transport legend */
+.legend { display: flex; flex-wrap: wrap; gap: 10px 22px; font-size: 0.85rem; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 8px; }
+.legend i { width: 22px; height: 3px; border-radius: 2px; display: inline-block; }
+.t-up { color: var(--up); } .t-down { color: var(--down); } .t-ws { color: var(--ws); } .t-http { color: var(--http); }
+
+.figure { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.scroll { overflow-x: auto; }
+.scroll svg { display: block; min-width: 760px; width: 100%; height: auto; }
+svg text { font-family: var(--font-body); fill: var(--fg); }
+svg .lbl { font-family: var(--font-mono); font-size: 11px; }
+svg .col-title { font-family: var(--font-display); font-weight: 700; font-size: 15px; }
+svg .sub { fill: var(--muted); font-size: 11.5px; }
+svg .col { fill: var(--bg); stroke: var(--line); stroke-width: 1; }
+svg .box { fill: var(--surface); stroke: var(--line); stroke-width: 1.2; }
+
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+td code { white-space: nowrap; }
+.table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+.table-wrap table { min-width: 680px; }
+.chip { display: inline-block; font-family: var(--font-mono); font-size: 0.72rem; padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+
+/* Steps: a real sequence, so they are numbered */
+.steps { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0; counter-reset: step; }
+.steps > li { counter-increment: step; display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 16px; padding-block: 22px; border-top: 1px solid var(--line); }
+.steps > li::before {
+  content: counter(step); font-family: var(--font-display); font-weight: 700; font-size: 1.05rem;
+  width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--surface); border: 1.5px solid var(--line);
+}
+.step-body { display: flex; flex-direction: column; gap: 10px; min-width: 0; max-width: 720px; }
+.step-body h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+
+/* WebM chunk anatomy */
+.chunks { display: flex; gap: 6px; flex-wrap: wrap; }
+.chunk { flex: 1 1 90px; min-width: 0; border: 1.5px solid var(--line); border-radius: 6px; padding: 8px 10px; font-family: var(--font-mono); font-size: 0.75rem; background: var(--surface); display: flex; flex-direction: column; gap: 2px; }
+.chunk b { font-weight: 500; }
+.chunk.header { border-color: var(--up); }
+.chunk.header b { color: var(--up); }
+.chunk small { color: var(--muted); }
+
+.two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+.panel h3 { font-size: 1rem; }
+
+.limits { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 0; }
+.limits li { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 14px; padding-block: 14px; border-top: 1px solid var(--line); }
+.limits li > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.area { color: var(--muted); }
+.note { font-size: 0.85rem; color: var(--muted); }
+
+footer { font-size: 0.85rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: 18px; }
+
+@media (max-width: 520px) {
+  body { padding-block: 28px 48px; }
+  .steps > li { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .limits li { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+}
+</style>
+
+<div class="page">
+
+  <header class="hero">
+    <div class="eyebrow">Project walkthrough · SSE-chat-ai</div>
+    <h1>SSE Voice Chat Internals</h1>
+    <p class="lead">You speak, the browser streams your voice to a NestJS server, and three services run in a chain: Deepgram turns speech into text, Gemini writes a reply, and ElevenLabs turns the reply into speech. Everything comes back to the browser over a single Server-Sent Events stream.</p>
+    <div class="callout">
+      <p><strong>The browser never uses a WebSocket.</strong> Audio goes up as many small HTTP <code>POST</code> requests, and results come down over one long-lived SSE connection. The only WebSocket in the system is between the server and Deepgram.</p>
+    </div>
+  </header>
+
+  <section>
+    <div class="eyebrow">01 · Architecture</div>
+    <h2>The big picture</h2>
+    <div class="figure">
+      <div class="scroll">
+        <svg viewBox="0 0 960 400" role="img" aria-label="Architecture: browser posts audio to the NestJS server, which streams to Deepgram over WebSocket, calls Gemini and ElevenLabs over HTTP streams, and sends all results back to the browser over one SSE stream.">
+          <defs>
+            <marker id="m-up" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--up)"/></marker>
+            <marker id="m-down" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--down)"/></marker>
+            <marker id="m-ws" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--ws)"/></marker>
+            <marker id="m-http" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--http)"/></marker>
+            <marker id="m-plain" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill: var(--muted)"/></marker>
+          </defs>
+
+          <!-- Columns -->
+          <rect class="col" x="20" y="20" width="240" height="360" rx="10"/>
+          <text class="col-title" x="40" y="50">Browser</text>
+          <text class="sub" x="40" y="68">Next.js · :3000</text>
+
+          <rect class="col" x="380" y="20" width="240" height="360" rx="10"/>
+          <text class="col-title" x="400" y="50">Server</text>
+          <text class="sub" x="400" y="68">NestJS · :3001</text>
+
+          <rect class="col" x="740" y="20" width="200" height="360" rx="10"/>
+          <text class="col-title" x="760" y="50">Providers</text>
+          <text class="sub" x="760" y="68">external APIs</text>
+
+          <!-- Browser boxes -->
+          <rect class="box" x="36" y="85" width="208" height="54" rx="7"/>
+          <text x="50" y="108" font-size="13" font-weight="600">Mic → MediaRecorder</text>
+          <text class="sub" x="50" y="126">WebM/Opus, 250 ms slices</text>
+
+          <rect class="box" x="36" y="200" width="208" height="54" rx="7"/>
+          <text x="50" y="223" font-size="13" font-weight="600">EventSource (useSSE)</text>
+          <text class="sub" x="50" y="241">transcript · token · audio · error</text>
+
+          <rect class="box" x="36" y="305" width="208" height="54" rx="7"/>
+          <text x="50" y="328" font-size="13" font-weight="600">Chat UI + audio queue</text>
+          <text class="sub" x="50" y="346">page.tsx, FIFO playback</text>
+
+          <!-- Server boxes -->
+          <rect class="box" x="396" y="85" width="208" height="54" rx="7"/>
+          <text x="410" y="108" font-size="13" font-weight="600">ConversationController</text>
+          <text class="sub" x="410" y="126">UUID check · 400 / 404</text>
+
+          <rect class="box" x="396" y="160" width="208" height="200" rx="7"/>
+          <text x="410" y="184" font-size="13" font-weight="600">ConversationService</text>
+          <text class="sub" x="410" y="206">Map&lt;sessionId, Session&gt;</text>
+          <text class="sub" x="410" y="226">transcriber (lazy)</text>
+          <text class="sub" x="410" y="246">replyQueue (promise chain)</text>
+          <text class="sub" x="410" y="266">closed flag</text>
+          <text class="sub" x="410" y="286">emit() → SSE subscriber</text>
+
+          <!-- Provider boxes -->
+          <rect class="box" x="756" y="150" width="168" height="50" rx="7"/>
+          <text x="770" y="172" font-size="13" font-weight="600">Deepgram</text>
+          <text class="sub" x="770" y="189">speech → text</text>
+
+          <rect class="box" x="756" y="225" width="168" height="50" rx="7"/>
+          <text x="770" y="247" font-size="13" font-weight="600">Gemini</text>
+          <text class="sub" x="770" y="264">writes the reply</text>
+
+          <rect class="box" x="756" y="300" width="168" height="50" rx="7"/>
+          <text x="770" y="322" font-size="13" font-weight="600">ElevenLabs</text>
+          <text class="sub" x="770" y="339">text → MP3 speech</text>
+
+          <!-- Upload: POST /audio -->
+          <line x1="246" y1="112" x2="392" y2="112" style="stroke: var(--up)" stroke-width="2.5" marker-end="url(#m-up)"/>
+          <text class="lbl" x="320" y="102" text-anchor="middle" style="fill: var(--up)">POST /audio</text>
+          <text class="lbl" x="320" y="130" text-anchor="middle" style="fill: var(--up)">raw bytes</text>
+
+          <!-- Controller to service -->
+          <line x1="500" y1="140" x2="500" y2="156" style="stroke: var(--muted)" stroke-width="1.5" marker-end="url(#m-plain)"/>
+
+          <!-- Down: SSE -->
+          <line x1="394" y1="227" x2="248" y2="227" style="stroke: var(--down)" stroke-width="3.5" marker-end="url(#m-down)"/>
+          <text class="lbl" x="320" y="217" text-anchor="middle" style="fill: var(--down)">GET /sse</text>
+          <text class="lbl" x="320" y="245" text-anchor="middle" style="fill: var(--down)">one stream</text>
+
+          <!-- Browser internal -->
+          <line x1="140" y1="255" x2="140" y2="301" style="stroke: var(--muted)" stroke-width="1.5" marker-end="url(#m-plain)"/>
+
+          <!-- Providers -->
+          <line x1="608" y1="175" x2="752" y2="175" style="stroke: var(--ws)" stroke-width="2.5" marker-start="url(#m-ws)" marker-end="url(#m-ws)"/>
+          <text class="lbl" x="680" y="166" text-anchor="middle" style="fill: var(--ws)">WebSocket</text>
+
+          <line x1="608" y1="250" x2="752" y2="250" style="stroke: var(--http)" stroke-width="2.5" marker-start="url(#m-http)" marker-end="url(#m-http)"/>
+          <text class="lbl" x="680" y="241" text-anchor="middle" style="fill: var(--http)">HTTP · SSE stream</text>
+
+          <line x1="608" y1="325" x2="752" y2="325" style="stroke: var(--http)" stroke-width="2.5" marker-start="url(#m-http)" marker-end="url(#m-http)"/>
+          <text class="lbl" x="680" y="316" text-anchor="middle" style="fill: var(--http)">HTTP · chunked</text>
+        </svg>
+      </div>
+      <div class="legend" aria-hidden="true">
+        <span><i style="background: var(--up)"></i>Upload (HTTP POST per chunk)</span>
+        <span><i style="background: var(--down)"></i>Download (Server-Sent Events)</span>
+        <span><i style="background: var(--ws)"></i>WebSocket (server ↔ Deepgram only)</span>
+        <span><i style="background: var(--http)"></i>Streaming HTTP to providers</span>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Layer</th><th>File</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td>Recorder</td><td><code>client/hooks/useAudioRecorder.ts</code></td><td>Captures the mic and POSTs audio chunks</td></tr>
+          <tr><td>SSE client</td><td><code>client/hooks/useSSE.ts</code></td><td>Opens the <code>EventSource</code> and collects events</td></tr>
+          <tr><td>UI</td><td><code>client/app/page.tsx</code></td><td>Chat bubbles and the audio playback queue</td></tr>
+          <tr><td>HTTP entry</td><td><code>conversation.controller.ts</code></td><td><code>GET /sse</code> and <code>POST /audio</code>, with validation</td></tr>
+          <tr><td>Coordinator</td><td><code>conversation.service.ts</code></td><td>Session registry; connects STT → LLM → TTS</td></tr>
+          <tr><td>Providers</td><td><code>server/src/integrations/</code></td><td>Thin wrappers around each provider's SDK</td></tr>
+          <tr><td>Config</td><td><code>config/configuration.ts</code></td><td>Typed config; checks env at startup</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="prose">
+    <div class="eyebrow">02 · Startup</div>
+    <h2>What happens when the server starts</h2>
+    <ol>
+      <li><code>main.ts</code> creates the Nest app and sets up CORS, a raw body parser for <code>application/octet-stream</code> (5&nbsp;MB limit, so audio arrives as a Node <code>Buffer</code>), shutdown hooks, and the port from config.</li>
+      <li><code>ConfigModule</code> loads <code>.env</code> and runs <code>validateEnv</code>. If an API key is missing or <code>PORT</code> isn't a number, the server refuses to start.</li>
+      <li><code>ConversationModule</code> creates one shared instance each of the Deepgram, Gemini and ElevenLabs services. Each builds its SDK client once, with its key from config.</li>
+      <li>Nothing connects to a provider yet. Connections open only when they're needed.</li>
+    </ol>
+  </section>
+
+  <section>
+    <div class="eyebrow">03 · One turn</div>
+    <h2>One conversation turn, step by step</h2>
+    <ol class="steps">
+
+      <li><div class="step-body">
+        <h3>The browser opens the SSE stream <span class="chip t-down">SSE</span></h3>
+        <p><code>page.tsx</code> creates <code>sessionId = crypto.randomUUID()</code> on first load, and <code>useSSE</code> opens <code>new EventSource('…/sse?sessionId=…')</code>. On the server, <code>ParseUUIDPipe</code> checks the ID and <code>openSession()</code> returns an RxJS <code>Observable</code>. When Nest subscribes, the service stores a session:</p>
+        <pre><code>{ id, subscriber, transcriber?: undefined,
+  replyQueue: Promise.resolve(), closed: false }</code></pre>
+        <p>Nest's <code>@Sse</code> keeps the response open with <code>Content-Type: text/event-stream</code>. Each <code>subscriber.next({ data })</code> is written as one event:</p>
+        <pre><code>data: {"type":"token","text":"Paris is"}\n\n</code></pre>
+        <p class="note">If the same <code>sessionId</code> reconnects, the old session is closed and replaced. A check of <code>sessions.get(id) === session</code> stops an old disconnect from removing the newer session.</p>
+      </div></li>
+
+      <li><div class="step-body">
+        <h3>The mic audio is cut into chunks <span class="chip t-up">POST</span></h3>
+        <p>Clicking the mic calls <code>getUserMedia({audio:true})</code> and <code>new MediaRecorder(stream)</code>. In Chrome this records a WebM container with the Opus codec. <code>mediaRecorder.start(250)</code> makes the browser produce a <code>Blob</code> every 250&nbsp;ms.</p>
+        <div class="chunks" aria-label="WebM chunk anatomy">
+          <div class="chunk header"><b>#1</b><small>WebM header + audio</small></div>
+          <div class="chunk"><b>#2</b><small>audio cluster</small></div>
+          <div class="chunk"><b>#3</b><small>audio cluster</small></div>
+          <div class="chunk"><b>#4</b><small>audio cluster</small></div>
+          <div class="chunk"><b>…</b><small>every 250 ms</small></div>
+        </div>
+        <p>These chunks are slices of one continuous file, not separate audio files. Only chunk #1 carries the header that describes the codec and sample rate; a later chunk can't be decoded on its own. So the receiver must get chunk #1 first and every chunk in order. This rule drives most of the server design.</p>
+        <pre><code>POST /audio?sessionId=&lt;uuid&gt;
+Content-Type: application/octet-stream
+&lt;bytes&gt;</code></pre>
+      </div></li>
+
+      <li><div class="step-body">
+        <h3>The server receives a chunk</h3>
+        <p>The controller checks that the body is a non-empty <code>Buffer</code> and the session exists: <strong>400</strong> for a bad body or ID, <strong>404</strong> for an unknown session. <code>pushAudio()</code> then connects to Deepgram lazily, on the first chunk or whenever the previous Deepgram connection has closed.</p>
+      </div></li>
+
+      <li><div class="step-body">
+        <h3>Deepgram's WebSocket and the buffering queue <span class="chip t-ws">WebSocket</span></h3>
+        <p><code>client.listen.live({...})</code> opens a WebSocket to Deepgram's live transcription endpoint:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code>model: nova-3</code></td><td>Speech-recognition model</td></tr>
+              <tr><td><code>language: en-US</code></td><td>Language</td></tr>
+              <tr><td><code>smart_format: true</code></td><td>Adds punctuation, capitals and number formatting</td></tr>
+              <tr><td><code>interim_results: true</code></td><td>Sends draft guesses while you're still talking</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Opening the socket takes a few hundred milliseconds, but audio arrives straight away. Dropping the early chunks would lose the WebM header and break the whole stream, so the service holds them in a queue until the socket opens:</p>
+        <pre><code>send(chunk):
+  if closed     → ignore
+  else if open  → socket.send(chunk)
+  else          → pending.push(chunk)        // still connecting
+
+on Open:
+  open = true
+  for chunk in pending (in order) → socket.send(chunk)   // header goes first
+  pending = []
+
+on Close: closed = true, pending = []</code></pre>
+        <p class="note">Each chunk is copied from the Node <code>Buffer</code> into a standalone <code>ArrayBuffer</code>. Buffers are often views into a larger shared memory pool, so sending <code>buffer.buffer</code> directly could send unrelated bytes.</p>
+      </div></li>
+
+      <li><div class="step-body">
+        <h3>Transcripts come back: interim, then final</h3>
+        <p>Deepgram sends JSON results over the same WebSocket. The service reads <code>channel.alternatives[0].transcript</code> and <code>is_final</code>. From the test run:</p>
+        <pre><code>"What is the capital"              isFinal:false   ← interim (draft)
+"What is the capital of France?"   isFinal:false   ← interim (revised)
+"What is the capital of France?"   isFinal:true    ← final (locked in)</code></pre>
+        <p>Every transcript goes to the browser as a <code>transcript</code> event, for live captions. Only a final, non-empty transcript starts an AI reply.</p>
+      </div></li>
+
+      <li><div class="step-body">
+        <h3>Replies run one at a time</h3>
+        <p>Two sentences spoken quickly produce two final transcripts. If both replies ran at once, their text and audio would mix in the stream. The service lines them up with a promise chain:</p>
+        <pre><code>session.replyQueue = session.replyQueue.then(() =&gt; this.reply(session, text));</code></pre>
+        <p>Each reply starts only after the previous one finishes. <code>reply()</code> catches its own errors, so one failure never blocks the replies after it.</p>
+      </div></li>
+
+      <li><div class="step-body">
+        <h3>Gemini streams the reply text <span class="chip t-http">HTTP stream</span></h3>
+        <p><code>model.generateContentStream(prompt)</code> calls <code>…:streamGenerateContent?alt=sse</code>, and Google streams the answer back as its own SSE stream. Each piece (usually a few words, not a single token) is forwarded at once as a <code>token</code> event and added to <code>fullText</code>.</p>
+        <p class="note">There is no conversation memory. The prompt is only the latest final transcript (PRD FR-7, not built yet).</p>
+      </div></li>
+
+      <li><div class="step-body">
+        <h3>ElevenLabs streams the speech <span class="chip t-http">HTTP chunked</span></h3>
+        <p>Only after Gemini finishes, <code>fullText</code> goes to <code>client.generate({ voice, model_id: eleven_turbo_v2_5, stream: true })</code>. ElevenLabs returns MP3 audio as a chunked HTTP response, in pieces of whatever size the network delivers.</p>
+        <p>Each piece is base64-encoded, because SSE only carries text, and sent as <code>{type:'audio', audio:'…'}</code>. Base64 makes the data about 33% bigger. Before each step the service checks <code>session.closed</code>, so work stops if the user disconnects.</p>
+      </div></li>
+
+      <li><div class="step-body">
+        <h3>The browser shows and plays the results</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Event</th><th>What the UI does</th></tr></thead>
+            <tbody>
+              <tr><td><code>transcript</code> interim</td><td>Shows a faded "you're speaking…" bubble</td></tr>
+              <tr><td><code>transcript</code> final</td><td>Moves the previous AI reply into history, then adds your message</td></tr>
+              <tr><td><code>token</code></td><td>Appends text to the streaming AI bubble, with a blinking cursor</td></tr>
+              <tr><td><code>audio</code></td><td>Adds the base64 MP3 to <code>audioQueue</code></td></tr>
+              <tr><td><code>error</code></td><td>Clears the streaming bubble and shows the error as an AI message</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Playback is first-in, first-out: if nothing is playing, play <code>new Audio('data:audio/mp3;base64,' + queue[0])</code>; when it ends or fails, drop it and play the next.</p>
+      </div></li>
+
+      <li><div class="step-body">
+        <h3>Cleanup</h3>
+        <p>When the browser closes the SSE connection (tab closed, refresh), the Observable's cleanup function runs <code>closeSession()</code>. It sets <code>closed = true</code>, closes the Deepgram WebSocket, ends the stream and removes the session from the map. On server shutdown, <code>onModuleDestroy</code> closes every session.</p>
+      </div></li>
+    </ol>
+  </section>
+
+  <section>
+    <div class="eyebrow">04 · Chunking</div>
+    <h2>Chunking at each stage</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Stage</th><th>Chunk unit</th><th>Size / timing</th><th>Format</th><th>Transport</th></tr></thead>
+        <tbody>
+          <tr><td>Mic → server</td><td>MediaRecorder blob</td><td>Every 250 ms</td><td>WebM/Opus; only #1 has the header</td><td><span class="chip t-up">HTTP POST each</span></td></tr>
+          <tr><td>Server → Deepgram</td><td>Same bytes, held until open</td><td>Same as above</td><td>WebM/Opus</td><td><span class="chip t-ws">WebSocket binary</span></td></tr>
+          <tr><td>Deepgram → server</td><td>Transcript result</td><td>Several per second</td><td>JSON</td><td><span class="chip t-ws">WebSocket text</span></td></tr>
+          <tr><td>Gemini → server</td><td>Piece of the answer</td><td>A few words each</td><td>JSON over SSE</td><td><span class="chip t-http">HTTP stream</span></td></tr>
+          <tr><td>Server → browser</td><td><code>token</code> event</td><td>One per Gemini piece</td><td>JSON in <code>data:</code></td><td><span class="chip t-down">SSE</span></td></tr>
+          <tr><td>ElevenLabs → server</td><td>MP3 bytes</td><td>Whatever the network delivers</td><td>MP3</td><td><span class="chip t-http">HTTP chunked</span></td></tr>
+          <tr><td>Server → browser</td><td><code>audio</code> event</td><td>One per MP3 piece</td><td>base64 in JSON</td><td><span class="chip t-down">SSE</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">05 · Transport choice</div>
+    <h2>Why SSE plus POST instead of a browser WebSocket</h2>
+    <div class="two-col">
+      <div class="panel">
+        <h3>Pros</h3>
+        <ul>
+          <li>SSE is plain HTTP and simple in Nest (<code>@Sse</code> + Observable).</li>
+          <li><code>EventSource</code> is built into browsers.</li>
+          <li>Works through most proxies.</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>Cons</h3>
+        <ul>
+          <li>SSE is one-way, so audio needs a separate upload path: many POSTs, each with full HTTP overhead.</li>
+          <li>The order of those POSTs isn't guaranteed, which is risky given the WebM ordering rule.</li>
+          <li>Audio has to travel as base64 text.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="prose note">The PRD keeps this design for now. A single browser WebSocket would remove the ordering and overhead problems.</p>
+  </section>
+
+  <section class="prose">
+    <div class="eyebrow">06 · Techniques</div>
+    <h2>Techniques used</h2>
+    <p>There's no custom algorithm. The system is built from these streaming patterns:</p>
+    <ul>
+      <li><strong>Time-slice chunking:</strong> <code>MediaRecorder</code> cuts audio every 250 ms.</li>
+      <li><strong>Buffer until open:</strong> an in-order queue guarantees the WebM header reaches Deepgram first.</li>
+      <li><strong>Lazy connect and reconnect:</strong> one Deepgram socket per session, opened when audio arrives and reopened if it closed.</li>
+      <li><strong>Interim, then final transcripts:</strong> drafts for live captions, final text to trigger a reply.</li>
+      <li><strong>Promise-chain queue:</strong> one reply at a time per session.</li>
+      <li><strong>Observable streaming:</strong> RxJS turns server events into a client stream, and its cleanup function handles teardown.</li>
+      <li><strong>Client playback queue:</strong> plays audio pieces in order.</li>
+      <li><strong>Closed flags:</strong> stop work once the client disconnects.</li>
+    </ul>
+  </section>
+
+  <section>
+    <div class="eyebrow">07 · Limitations</div>
+    <h2>Known limitations</h2>
+    <p class="prose note">Found by reading the code, not by testing.</p>
+    <ul class="limits">
+      <li><span class="chip area">Client</span><div><strong>Audio POSTs can arrive out of order.</strong><span>The recorder fires every 250 ms without waiting for the previous POST. A slow request can be overtaken, which would corrupt the WebM stream sent to Deepgram.</span></div></li>
+      <li><span class="chip area">Server</span><div><strong>A fast stop/start may break transcription.</strong><span>A new recording sends a second WebM header down the same Deepgram socket if it hasn't closed yet (it closes after about 10 s of silence without a KeepAlive). Deepgram probably can't decode a second header mid-stream.</span></div></li>
+      <li><span class="chip area">Server</span><div><strong>A dropped Deepgram connection mid-recording isn't recoverable.</strong><span>The reconnect never receives the header chunk.</span></div></li>
+      <li><span class="chip area">Server</span><div><strong>Replies can trigger too early.</strong><span><code>is_final</code> locks in a segment of speech, not the end of what you're saying, which is why two sentences produced two replies. Deepgram's <code>speech_final</code> / <code>UtteranceEnd</code> would detect the end more reliably (PRD M1).</span></div></li>
+      <li><span class="chip area">Server</span><div><strong>Higher latency than needed.</strong><span>Speech synthesis waits for the whole Gemini reply. Sending each sentence to ElevenLabs as it completes would cut the delay noticeably.</span></div></li>
+      <li><span class="chip area">Client</span><div><strong>The client drops events.</strong><span>The page only processes the last event per render, so quick bursts of <code>token</code> or <code>audio</code> events are skipped. The message list also grows forever.</span></div></li>
+      <li><span class="chip area">Client</span><div><strong>Choppy audio.</strong><span>Each MP3 piece plays as a separate <code>Audio</code> element. Pieces can split audio frames, causing gaps or clicks. Web Audio or MediaSource would play it smoothly.</span></div></li>
+      <li><span class="chip area">Both</span><div><strong>No reconnect, memory or scaling.</strong><span><code>useSSE</code> closes on error and never reconnects. There's no chat history. Sessions live in one process's memory, so the server can't run as more than one instance.</span></div></li>
+    </ul>
+  </section>
+
+  <footer>
+    Snapshot of the code as of 17 November 2026. At the time of testing, Deepgram transcription worked end to end; the Gemini API key was rejected, so the reply and speech steps were verified separately.
+  </footer>
+</div>
+
+</body></html>
